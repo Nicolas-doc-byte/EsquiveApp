@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Esquive</title>
+<style>
+  :root{
+    --nuit:#1b1340;
+    --encre:#f5f0ff;
+    --rose:#ff4d8d;
+    --or:#ffc94d;
+    --menthe:#5ef2c2;
+  }
+  html,body{
+    margin:0;height:100%;background:var(--nuit);overflow:hidden;
+    touch-action:none;-webkit-user-select:none;user-select:none;
+    -webkit-tap-highlight-color:transparent;
+    font-family:"Trebuchet MS","Segoe UI",system-ui,sans-serif;color:var(--encre);
+  }
+  canvas{display:block;width:100%;height:100%}
+  #ecran{
+    position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;padding:24px;box-sizing:border-box;background:rgba(27,19,64,.86);
+  }
+  #ecran.cache{display:none}
+  h1{font-size:clamp(44px,14vw,84px);margin:0 0 6px;letter-spacing:-2px;line-height:1;font-weight:900}
+  p{margin:6px 0;max-width:30ch;line-height:1.45;font-size:17px;opacity:.9}
+  #score-final{font-size:56px;font-weight:900;color:var(--or);margin:4px 0}
+  button{
+    margin-top:26px;padding:16px 46px;font-size:22px;font-weight:800;font-family:inherit;
+    background:var(--menthe);color:var(--nuit);border:0;border-radius:40px;
+    box-shadow:0 6px 0 #2fb48d;cursor:pointer;
+  }
+  button:active{transform:translateY(4px);box-shadow:0 2px 0 #2fb48d}
+  button:focus-visible{outline:3px solid var(--or);outline-offset:4px}
+  @media (prefers-reduced-motion:reduce){button:active{transform:none}}
+  button.second{margin-top:16px;padding:12px 28px;font-size:18px;background:var(--or);box-shadow:0 6px 0 #b8862a}
+  button.second:active{box-shadow:0 2px 0 #b8862a}
+</style>
+</head>
+<body>
+<canvas id="jeu"></canvas>
+
+<div id="ecran">
+  <h1 id="titre">Esquive</h1>
+  <p id="texte">Glisse ton doigt à gauche et à droite pour éviter les rochers. Ramasse les pièces dorées.</p>
+  <div id="score-final" hidden></div>
+  <p id="record"></p>
+  <button id="btn-vie" class="second" hidden>Regarder une pub : +1 vie</button>
+  <button id="btn">Jouer</button>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('jeu');
+  const ctx = cv.getContext('2d');
+  const ecran = document.getElementById('ecran');
+  const titre = document.getElementById('titre');
+  const texte = document.getElementById('texte');
+  const scoreFinal = document.getElementById('score-final');
+  const recordEl = document.getElementById('record');
+  const btn = document.getElementById('btn');
+  const btnVie = document.getElementById('btn-vie');
+  // Pont pub : AndroidAds n'existe que dans l'app Android. Dans un navigateur, il n'y a simplement pas de pub.
+  const pubs = typeof window.AndroidAds !== 'undefined';
+
+  const C = {nuit:'#1b1340', rose:'#ff4d8d', or:'#ffc94d', menthe:'#5ef2c2', encre:'#f5f0ff'};
+
+  let W = 0, H = 0, dpr = 1;
+  function resize(){
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    if (joueur) joueur.y = H * 0.82;
+  }
+  window.addEventListener('resize', resize);
+
+  // Record sauvegardé si possible
+  let record = 0;
+  try { record = parseInt(localStorage.getItem('esquive_record') || '0', 10) || 0; } catch(e){}
+  function sauverRecord(){ try { localStorage.setItem('esquive_record', String(record)); } catch(e){} }
+
+  // Son
+  let audio = null;
+  function bip(freq, dur, type, vol){
+    if (!audio) return;
+    try {
+      const o = audio.createOscillator(), g = audio.createGain();
+      o.type = type || 'sine'; o.frequency.value = freq;
+      g.gain.value = vol || 0.08;
+      g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + dur);
+      o.connect(g); g.connect(audio.destination);
+      o.start(); o.stop(audio.currentTime + dur);
+    } catch(e){}
+  }
+
+  // État
+  let joueur, rochers, pieces, etoiles, particules;
+  let etat = 'menu';
+  let temps, pieceCount, vies, invul, tremble, spawnR, spawnP, derniere;
+  let vieBonus = false, attentePub = false;
+  let cibleX = 0;
+  const touches = {};
+
+  function creerEtoiles(){
+    etoiles = [];
+    for (let i = 0; i < 70; i++){
+      etoiles.push({x:Math.random()*W, y:Math.random()*H, r:Math.random()*1.6+.4, v:Math.random()*30+10});
+    }
+  }
+
+  function init(){
+    joueur = {x:W/2, y:H*0.82, r:16, trail:[]};
+    cibleX = W/2;
+    rochers = []; pieces = []; particules = [];
+    temps = 0; pieceCount = 0; vies = 3; invul = 0; tremble = 0; vieBonus = false;
+    spawnR = 0.6; spawnP = 2;
+  }
+
+  function creerRocher(){
+    const r = 14 + Math.random()*22;
+    const n = 7, pts = [];
+    for (let i = 0; i < n; i++){
+      const a = (i/n)*Math.PI*2, k = 0.75 + Math.random()*0.35;
+      pts.push([Math.cos(a)*r*k, Math.sin(a)*r*k]);
+    }
+    const diff = 1 + temps/22;
+    rochers.push({
+      x: r + Math.random()*(W - 2*r), y:-r*2, r,
+      vy: (130 + Math.random()*90) * diff,
+      vx: (Math.random()-.5) * 50 * Math.min(diff,2.5),
+      rot: Math.random()*6, vr:(Math.random()-.5)*3, pts
+    });
+  }
+
+  function creerPiece(){
+    pieces.push({x:20 + Math.random()*(W-40), y:-20, r:11, vy:150 + temps*1.5, ph:Math.random()*6});
+  }
+
+  function boom(x, y, couleur, n){
+    for (let i = 0; i < n; i++){
+      const a = Math.random()*Math.PI*2, s = 60 + Math.random()*180;
+      particules.push({x, y, vx:Math.cos(a)*s, vy:Math.sin(a)*s, vie:.5 + Math.random()*.4, max:.9, c:couleur});
+    }
+  }
+
+  function score(){ return Math.floor(temps*5) + pieceCount*10; }
+
+  function demarrer(){
+    if (!audio){
+      try { audio = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
+    }
+    if (audio && audio.state === 'suspended') audio.resume();
+    init();
+    etat = 'jeu';
+    ecran.classList.add('cache');
+    derniere = performance.now();
+    bip(520, .12, 'triangle');
+  }
+
+  function continuer(){
+    vieBonus = true; vies = 1; invul = 2; rochers = []; tremble = 0;
+    etat = 'jeu';
+    ecran.classList.add('cache');
+    derniere = performance.now();
+    bip(660, .15, 'triangle');
+  }
+
+  function perdu(){
+    etat = 'fin';
+    const s = score();
+    const nouveau = s > record;
+    if (nouveau){ record = s; sauverRecord(); }
+    titre.textContent = 'Perdu';
+    texte.textContent = 'Ton score';
+    scoreFinal.hidden = false;
+    scoreFinal.textContent = s;
+    recordEl.textContent = nouveau ? 'Nouveau record !' : 'Record : ' + record;
+    btn.textContent = 'Rejouer';
+    btnVie.disabled = false;
+    btnVie.hidden = !(pubs && !vieBonus && window.AndroidAds.isRewardedReady());
+    ecran.classList.remove('cache');
+    bip(180, .5, 'sawtooth', .1);
+  }
+
+  function maj(dt){
+    temps += dt;
+    const diff = 1 + temps/22;
+
+    // Déplacement
+    if (touches.ArrowLeft || touches.a || touches.q) cibleX -= 620*dt;
+    if (touches.ArrowRight || touches.d) cibleX += 620*dt;
+    cibleX = Math.max(joueur.r, Math.min(W - joueur.r, cibleX));
+    joueur.x += (cibleX - joueur.x) * Math.min(1, dt*16);
+    joueur.trail.push({x:joueur.x, y:joueur.y});
+    if (joueur.trail.length > 12) joueur.trail.shift();
+
+    // Apparitions
+    spawnR -= dt;
+    if (spawnR <= 0){ creerRocher(); spawnR = Math.max(0.22, 0.75/diff) * (0.7 + Math.random()*0.6); }
+    spawnP -= dt;
+    if (spawnP <= 0){ creerPiece(); spawnP = 1.6 + Math.random()*1.6; }
+
+    if (invul > 0) invul -= dt;
+    if (tremble > 0) tremble -= dt;
+
+    // Rochers
+    for (let i = rochers.length-1; i >= 0; i--){
+      const o = rochers[i];
+      o.y += o.vy*dt; o.x += o.vx*dt; o.rot += o.vr*dt;
+      if (o.x < o.r || o.x > W-o.r) o.vx *= -1;
+      if (o.y > H + 60){ rochers.splice(i,1); continue; }
+      const dx = o.x - joueur.x, dy = o.y - joueur.y;
+      if (invul <= 0 && dx*dx + dy*dy < (o.r*0.8 + joueur.r*0.8)**2){
+        rochers.splice(i,1);
+        vies--; invul = 1.3; tremble = .3;
+        boom(joueur.x, joueur.y, C.rose, 22);
+        bip(140, .25, 'square', .09);
+        if (navigator.vibrate) navigator.vibrate(60);
+        if (vies <= 0){ perdu(); return; }
+      }
+    }
+
+    // Pièces
+    for (let i = pieces.length-1; i >= 0; i--){
+      const p = pieces[i];
+      p.y += p.vy*dt; p.ph += dt*6;
+      if (p.y > H + 30){ pieces.splice(i,1); continue; }
+      const dx = p.x - joueur.x, dy = p.y - joueur.y;
+      if (dx*dx + dy*dy < (p.r + joueur.r + 4)**2){
+        pieces.splice(i,1); pieceCount++;
+        boom(p.x, p.y, C.or, 12);
+        bip(880 + Math.min(pieceCount,12)*40, .1, 'triangle');
+      }
+    }
+
+    // Particules et étoiles
+    for (let i = particules.length-1; i >= 0; i--){
+      const q = particules[i];
+      q.x += q.vx*dt; q.y += q.vy*dt; q.vie -= dt;
+      if (q.vie <= 0) particules.splice(i,1);
+    }
+    for (const s of etoiles){
+      s.y += s.v*dt*diff;
+      if (s.y > H){ s.y = -2; s.x = Math.random()*W; }
+    }
+  }
+
+  function dessiner(){
+    ctx.save();
+    if (tremble > 0){
+      ctx.translate((Math.random()-.5)*8, (Math.random()-.5)*8);
+    }
+    ctx.fillStyle = C.nuit;
+    ctx.fillRect(-10,-10,W+20,H+20);
+
+    // Étoiles
+    ctx.fillStyle = 'rgba(245,240,255,.7)';
+    for (const s of etoiles){
+      ctx.globalAlpha = .25 + s.r/2.2;
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 7); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    if (etat !== 'menu' && joueur){
+      // Pièces
+      for (const p of pieces){
+        const k = Math.abs(Math.sin(p.ph));
+        ctx.fillStyle = C.or;
+        ctx.beginPath(); ctx.ellipse(p.x, p.y, p.r*(0.45 + 0.55*k), p.r, 0, 0, 7); ctx.fill();
+        ctx.strokeStyle = '#b8862a'; ctx.lineWidth = 2; ctx.stroke();
+      }
+
+      // Rochers
+      for (const o of rochers){
+        ctx.save();
+        ctx.translate(o.x, o.y); ctx.rotate(o.rot);
+        ctx.beginPath();
+        o.pts.forEach((pt,i) => i ? ctx.lineTo(pt[0],pt[1]) : ctx.moveTo(pt[0],pt[1]));
+        ctx.closePath();
+        ctx.fillStyle = C.rose; ctx.fill();
+        ctx.lineWidth = 3; ctx.strokeStyle = '#9c2759'; ctx.stroke();
+        ctx.restore();
+      }
+
+      // Traînée + joueur
+      const clignote = invul > 0 && Math.floor(invul*14) % 2 === 0;
+      if (!clignote){
+        joueur.trail.forEach((t,i) => {
+          ctx.globalAlpha = i/joueur.trail.length*.35;
+          ctx.fillStyle = C.menthe;
+          ctx.beginPath(); ctx.arc(t.x, t.y + (joueur.trail.length-i)*2, joueur.r*(i/joueur.trail.length), 0, 7); ctx.fill();
+        });
+        ctx.globalAlpha = 1;
+        const g = ctx.createRadialGradient(joueur.x-5, joueur.y-5, 2, joueur.x, joueur.y, joueur.r);
+        g.addColorStop(0, '#ffffff'); g.addColorStop(1, C.menthe);
+        ctx.fillStyle = g;
+        ctx.beginPath(); ctx.arc(joueur.x, joueur.y, joueur.r, 0, 7); ctx.fill();
+      }
+
+      // Particules
+      for (const q of particules){
+        ctx.globalAlpha = Math.max(0, q.vie/q.max);
+        ctx.fillStyle = q.c;
+        ctx.fillRect(q.x-2, q.y-2, 4, 4);
+      }
+      ctx.globalAlpha = 1;
+
+      // Interface en jeu
+      ctx.fillStyle = C.encre;
+      ctx.font = '900 34px "Trebuchet MS",system-ui,sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      ctx.fillText(score(), 18, 18 + (window.visualViewport ? 0 : 0));
+      ctx.font = '700 14px "Trebuchet MS",system-ui,sans-serif';
+      ctx.globalAlpha = .7;
+      ctx.fillText('Record ' + Math.max(record, score()), 18, 58);
+      ctx.globalAlpha = 1;
+      for (let i = 0; i < 3; i++){
+        ctx.beginPath();
+        ctx.arc(W - 26 - i*26, 32, 8, 0, 7);
+        if (i < vies){ ctx.fillStyle = C.rose; ctx.fill(); }
+        else { ctx.strokeStyle = 'rgba(245,240,255,.4)'; ctx.lineWidth = 2; ctx.stroke(); }
+      }
+    }
+    ctx.restore();
+  }
+
+  function boucle(now){
+    const dt = Math.min(0.05, (now - derniere)/1000 || 0);
+    derniere = now;
+    if (etat === 'jeu') maj(dt);
+    else if (etat !== 'jeu') {
+      for (const s of etoiles){ s.y += s.v*dt; if (s.y > H){ s.y = -2; s.x = Math.random()*W; } }
+    }
+    dessiner();
+    requestAnimationFrame(boucle);
+  }
+
+  // Contrôles
+  function pointeur(e){
+    if (etat !== 'jeu') return;
+    const t = e.touches ? e.touches[0] : e;
+    cibleX = t.clientX;
+    e.preventDefault && e.preventDefault();
+  }
+  cv.addEventListener('touchstart', pointeur, {passive:false});
+  cv.addEventListener('touchmove', pointeur, {passive:false});
+  cv.addEventListener('mousemove', e => { if (e.buttons || e.pointerType === 'mouse') pointeur(e); });
+  cv.addEventListener('mousedown', pointeur);
+  window.addEventListener('keydown', e => { touches[e.key] = true; if (e.key === 'Enter' && etat !== 'jeu') demarrer(); });
+  window.addEventListener('keyup', e => { touches[e.key] = false; });
+  // Pub récompensée : +1 vie (une seule fois par partie)
+  btnVie.addEventListener('click', () => {
+    btnVie.disabled = true;
+    window.AndroidAds.showRewarded();
+  });
+  window.onRewardedResult = function(ok){
+    btnVie.disabled = false;
+    if (ok){ continuer(); }
+    else { recordEl.textContent = 'Pub indisponible, réessaie dans un instant.'; }
+  };
+
+  // Pub interstitielle : quand le joueur relance une partie après avoir tout perdu
+  btn.addEventListener('click', () => {
+    if (etat === 'fin' && pubs){
+      attentePub = true;
+      btn.disabled = true;
+      window.AndroidAds.showInterstitial();
+    } else {
+      demarrer();
+    }
+  });
+  window.onInterstitialClosed = function(){
+    if (!attentePub) return;
+    attentePub = false;
+    btn.disabled = false;
+    demarrer();
+  };
+
+  resize();
+  creerEtoiles();
+  init();
+  recordEl.textContent = record ? 'Record : ' + record : '';
+  derniere = performance.now();
+  requestAnimationFrame(boucle);
+})();
+</script>
+</body>
+</html>
